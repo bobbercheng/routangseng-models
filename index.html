@@ -383,13 +383,18 @@ window.clearChat = function() {
 
 window.sendMessage = async function() {
   const text = input.value.trim();
-  if (!text || generating || !model || !processor) return;
+  console.log(`[sendMessage] called, text="${text?.substring(0,30)}", generating=${generating}, model=${!!model}, processor=${!!processor}`);
+  if (!text || generating || !model || !processor) {
+    console.log(`[sendMessage] blocked: text=${!!text}, generating=${generating}, model=${!!model}, processor=${!!processor}`);
+    return;
+  }
 
   const ts = () => new Date().toISOString();
   generating = true;
   input.value = '';
   input.style.height = 'auto';
   sendBtn.disabled = true;
+  input.disabled = true;
   addMsg('user', text);
   messages.push({ role: 'user', content: text });
 
@@ -398,6 +403,9 @@ window.sendMessage = async function() {
   const assistantDiv = addMsg('assistant', '');
   assistantDiv.innerHTML = '<span class="typing">思考中<span class="dots">...</span></span>';
   updateStatus('Generating...');
+
+  // Yield to browser so DOM updates render before heavy computation
+  await new Promise(r => setTimeout(r, 50));
 
   try {
     const allMessages = [
@@ -521,6 +529,7 @@ window.sendMessage = async function() {
 
   generating = false;
   sendBtn.disabled = false;
+  input.disabled = false;
   input.focus();
 };
 
