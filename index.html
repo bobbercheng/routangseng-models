@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>肉糖生 Chat · WebGPU</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+header { background: #16213e; padding: 12px 20px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #0f3460; }
+header h1 { font-size: 18px; color: #e94560; }
+.badge { background: #0f3460; color: #53a8b6; padding: 3px 10px; border-radius: 12px; font-size: 12px; }
+#status { font-size: 12px; color: #888; margin-left: auto; }
+#chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.msg { padding: 10px 14px; border-radius: 12px; max-width: 85%; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.msg.system { background: #16213e; color: #53a8b6; align-self: center; font-size: 13px; text-align: center; max-width: 90%; }
+.msg.user { background: #0f3460; color: #e0e0e0; align-self: flex-end; }
+.msg.assistant { background: #1a1a2e; border: 1px solid #333; color: #e0e0e0; align-self: flex-start; }
+footer { background: #16213e; padding: 12px 16px; border-top: 1px solid #0f3460; display: flex; gap: 8px; }
+#input { flex: 1; background: #1a1a2e; border: 1px solid #333; color: #e0e0e0; padding: 10px 14px; border-radius: 8px; font-size: 14px; outline: none; resize: none; overflow-y: hidden; font-family: inherit; line-height: 1.5; max-height: 120px; }
+#input:focus { border-color: #e94560; }
+button { background: #e94560; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button:hover:not(:disabled) { background: #c73e54; }
+#progress-bar { height: 3px; background: #e94560; width: 0%; transition: width 0.3s; position: fixed; top: 0; left: 0; z-index: 100; }
+.typing { color: #888; font-style: italic; }
+.typing .dots { animation: blink 1.4s infinite; }
+@keyframes blink { 0%,20% { opacity: 1; } 50% { opacity: 0.3; } 80%,100% { opacity: 1; } }
+</style>
+</head>
+<body>
+<div id="progress-bar"></div>
+<header>
+  <h1>🥩 肉糖生</h1>
+  <span class="badge" id="model-badge">肉糖生 · ONNX · WebGPU</span>
+  <span id="status">Initializing...</span>
+</header>
+<div id="chat">
+  <div class="msg system">正在加载模型，请稍候... (浏览器本地 WebGPU，首次加载需下载约 1GB 权重)</div>
+</div>
+<footer>
+  <button id="clear" onclick="clearChat()" title="新对话" style="background:#0f3460;padding:10px 12px;">🗑</button>
+  <textarea id="input" rows="1" placeholder="输入消息..." disabled></textarea>
+  <button id="send" disabled onclick="sendMessage()">发送</button>
+</footer>
+
+<!-- CDN override: ALL model files served from GitHub Pages -->
+<script>
+(function() {
+  const GITHUB_BASE = 'https://bobbercheng.github.io/routangseng-models';
+  const ONNX_BASE = GITHUB_BASE + '/onnx';
+
+  // Bump MODEL_VERSION when you update model weights to invalidate cache
+  const MODEL_VERSION = 'v3-2026-03-18';
+  const CHUNK_MANIFEST = {
+    'decoder_model_merged_quantized.onnx_data': { chunks: 15, totalMB: 721 },
+    'embed_tokens_quantized.onnx_data': { chunks: 5, totalMB: 243 },
+    'vision_encoder_quantized.onnx_data': { chunks: 2, totalMB: 97 },
+  };
+  const PARALLEL_DOWNLOADS = 4;
+
+  // Whitelist: ONLY these files exist on GitHub Pages and should be redirected.
+  // Any file NOT in this list falls through to HuggingFace (avoids GitHub 404 HTML responses).
+  const GITHUB_FILES = {
+    'config.json': 'config.json',
+    'generation_config.json': 'generation_config.json',
+    'tokenizer.json': 'tokenizer.json',
+    'tokenizer_config.json': 'tokenizer_config.json',
+    'preprocessor_config.json': 'preprocessor_config.json',
+    'processor_config.json': 'processor_config.json',
+    'chat_template.jinja': 'chat_template.jinja',
+    'decoder_model_merged_quantized.onnx': 'onnx/decoder_model_merged_quantized.onnx',
+    'embed_tokens_quantized.onnx': 'onnx/embed_tokens_quantized.onnx',
+    'vision_encoder_quantized.onnx': 'onnx/vision_encoder_quantized.onnx',
+  };
+
+  const TOTAL_MODEL_MB = 721 + 243 + 97;
+  let globalLoadedMB = 0;
+  let globalCachedMB = 0;
+  let dlStartTime = 0;
+
+  function updateDownloadProgress() {
+    const statusEl = document.getElementById('status');
+    const progressBar = document.getElementById('progress-bar');
+    if (!statusEl || !progressBar) return;
+
+    const totalDone = globalLoadedMB + globalCachedMB;
+    const pct = Math.min(95, Math.round((totalDone / TOTAL_MODEL_MB) * 100));
+    progressBar.style.width = (5 + pct * 0.9) + '%';
+
+    if (globalCachedMB > 0 && globalLoadedMB === 0) {
+      statusEl.textContent = `从缓存加载... ${totalDone.toFixed(0)} / ${TOTAL_MODEL_MB} MB (${pct}%)`;
+    } else {
+      let info = `${totalDone.toFixed(0)} / ${TOTAL_MODEL_MB} MB (${pct}%)`;
+      if (dlStartTime && globalLoadedMB > 0) {
+        const elapsed = (Date.now() - dlStartTime) / 1000;
+        if (elapsed > 1) {
+          const speed = globalLoadedMB / elapsed;
+          const remaining = TOTAL_MODEL_MB - totalDone;
+          const eta = remaining > 0 ? Math.round(remaining / speed) : 0;
+          info += ` · ${speed.toFixed(1)} MB/s`;
+          if (eta > 0) info += ` · ${eta}s`;
+        }
+      }
+      if (globalCachedMB > 0) info += ` (${globalCachedMB.toFixed(0)} MB cached)`;
+      statusEl.textContent = `下载模型权重... ${info}`;
+    }
+  }
+
+  const CACHE_NAME = `onnx-${MODEL_VERSION}`;
+
+  async function fetchOneChunk(filename, i) {
+    const chunkName = `${filename}.${String(i).padStart(2, '0')}.chunk`;
+    const url = `${ONNX_BASE}/${chunkName}`;
+
+    try {
+      const cache = await caches.open(CACHE_NAME);
+      const cached = await cache.match(url);
+      if (cached) {
+        const buf = await cached.arrayBuffer();
+        const mb = buf.byteLength / 1048576;
+        globalCachedMB += mb;
+        updateDownloadProgress();
+        console.log(`[GitHub]   ${chunkName}: ${mb.toFixed(0)} MB (cached)`);
+        return buf;
+      }
+    } catch (e) { /* cache miss */ }
+
+    if (!dlStartTime) dlStartTime = Date.now();
+    const resp = await _origFetch(url);
+    if (!resp.ok) throw new Error(`Failed: ${chunkName} ${resp.status}`);
+
+    try {
+      const cache = await caches.open(CACHE_NAME);
+      cache.put(url, resp.clone()).catch(() => {});
+    } catch (e) { /* best-effort cache */ }
+
+    const buf = await resp.arrayBuffer();
+    const mb = buf.byteLength / 1048576;
+    globalLoadedMB += mb;
+    updateDownloadProgress();
+    console.log(`[GitHub]   ${chunkName}: ${mb.toFixed(0)} MB (downloaded)`);
+    return buf;
+  }
+
+  async function fetchChunked(filename) {
+    const manifest = CHUNK_MANIFEST[filename];
+    const numChunks = manifest.chunks;
+    console.log(`[GitHub] Fetching ${filename}: ${numChunks} chunks (parallel=${PARALLEL_DOWNLOADS})...`);
+
+    const results = new Array(numChunks);
+    let nextIdx = 0;
+
+    async function worker() {
+      while (nextIdx < numChunks) {
+        const idx = nextIdx++;
+        results[idx] = await fetchOneChunk(filename, idx);
+      }
+    }
+
+    const workers = [];
+    for (let w = 0; w < Math.min(PARALLEL_DOWNLOADS, numChunks); w++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+
+    const blob = new Blob(results);
+    console.log(`[GitHub] ${filename}: ${(blob.size/1048576).toFixed(0)} MB assembled`);
+
+    return new Response(blob, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': blob.size.toString(),
+      },
+    });
+  }
+
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {
+    let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+
+    // Intercept file download URLs, but NOT HuggingFace API metadata calls
+    // API calls: huggingface.co/api/models/... → pass through to HF
+    // File downloads: huggingface.co/{user}/{repo}/resolve/main/{file} → redirect to GitHub
+    // Also catches: cdn-lfs.hf.co/... and other CDN patterns
+    if ((url.includes('routangseng-0.8b-hottake-onnx') || url.includes('routangseng-0.8b'))
+        && !url.includes('/api/')) {
+      const filename = url.split('/').pop().split('?')[0];
+
+      // Chunked ONNX data files → assemble from GitHub chunks
+      if (filename in CHUNK_MANIFEST) {
+        return fetchChunked(filename);
+      }
+
+      // Whitelisted files → fetch from GitHub Pages, cache as ArrayBuffer for re-reads
+      if (filename in GITHUB_FILES) {
+        const githubUrl = `${GITHUB_BASE}/${GITHUB_FILES[filename]}`;
+        console.log(`[GitHub] ${filename} → ${githubUrl}`);
+
+        // Cache the ArrayBuffer so repeated fetches get a fresh Response
+        if (!window._githubFileCache) window._githubFileCache = {};
+        if (window._githubFileCache[filename]) {
+          const buf = window._githubFileCache[filename];
+          console.log(`[GitHub] ${filename} → from memory cache (${buf.byteLength} bytes)`);
+          return Promise.resolve(new Response(buf.slice(0), { status: 200, headers: { 'Content-Type': filename.endsWith('.json') ? 'application/json' : 'application/octet-stream' } }));
+        }
+
+        return _origFetch(githubUrl).then(async (resp) => {
+          if (!resp.ok) throw new Error(`GitHub fetch failed: ${filename} ${resp.status}`);
+          const buf = await resp.arrayBuffer();
+          window._githubFileCache[filename] = buf;
+          console.log(`[GitHub] ${filename} → fetched & cached (${buf.byteLength} bytes)`);
+          return new Response(buf.slice(0), { status: 200, headers: { 'Content-Type': filename.endsWith('.json') ? 'application/json' : 'application/octet-stream' } });
+        });
+      }
+
+      // Everything else (added_tokens.json, special_tokens_map.json, etc.)
+      // These don't exist on GitHub OR HuggingFace — return a proper 404
+      // so transformers.js handles it gracefully (it expects 404 for optional files)
+      console.log(`[GitHub] ${filename} → 404 (not in whitelist)`);
+      return Promise.resolve(new Response('Not Found', { status: 404, statusText: 'Not Found' }));
+    }
+
+    return _origFetch(input, init);
+  };
+  console.log('[GitHub] Fetch override installed — all model files served from GitHub Pages');
+})();
+</script>
+
+<script type="module">
+import {
+  AutoProcessor,
+  Qwen3_5ForConditionalGeneration,
+  TextStreamer,
+} from './assets/transformers.js';
+
+// Still use the HF model ID so transformers.js knows the architecture,
+// but all actual file fetches are intercepted and redirected to GitHub Pages
+const DEFAULT_MODEL = 'bobber/routangseng-0.8b-hottake-onnx';
+const params = new URLSearchParams(window.location.search);
+const modelParam = params.get('model');
+const MODEL_ID = modelParam ? (modelParam.includes('/') ? modelParam : `bobber/${modelParam}`) : DEFAULT_MODEL;
+if (modelParam) {
+  const shortName = MODEL_ID.split('/').pop();
+  document.getElementById('model-badge').textContent = shortName + ' · ONNX · WebGPU';
+}
+const SYSTEM_PROMPT = '你是肉糖生，一个接地气的中文时政分析者。风格：结论先行，再用结构化分析展开；敢于质疑主流叙事，不和稀泥；用类比和现实例子把复杂问题讲透；语气直率但逻辑严密。回答时先给核心判断，再分层拆解，最后给出预测或建议。直接给出分析，不要先描述用户的问题或你的计划。';
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const MAX_TOKENS = isMobile ? 512 : 1024;
+
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const statusEl = document.getElementById('status');
+const progressBar = document.getElementById('progress-bar');
+
+let processor = null;
+let model = null;
+let messages = [];
+let generating = false;
+
+function updateStatus(text) { statusEl.textContent = text; }
+function setProgress(pct) { progressBar.style.width = pct + '%'; }
+
+function addMsg(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+function stripThinkTags(text) {
+  text = text.replace(/<think>[\s\S]*?<\/think>/g, '');
+  text = text.replace(/<\/?think>/g, '');
+  return text.trim();
+}
+
+async function getBestDevice() {
+    if (!navigator.gpu) {
+        console.warn("WebGPU not supported. Falling back to WASM.");
+        return 'wasm';
+    }
+    try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            console.warn("No WebGPU adapter found. Falling back to WASM.");
+            return 'wasm';
+        }
+        return 'webgpu';
+    } catch (err) {
+        console.warn("WebGPU initialization failed. Falling back to WASM.", err);
+        return 'wasm';
+    }
+}
+
+async function init() {
+  try {
+    if (!navigator.gpu) {
+      addMsg('system', '⚠️ 此浏览器不支持 WebGPU。请使用 Chrome 或 Edge。');
+      updateStatus('WebGPU not available');
+      return;
+    }
+
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) {
+        const info = adapter.info || {};
+        const limits = adapter.limits || {};
+        const gpuDesc = info.description || info.device || info.architecture || 'unknown';
+        const gpuVendor = info.vendor || 'unknown';
+        const maxBuf = limits.maxBufferSize ? (limits.maxBufferSize / 1048576).toFixed(0) + 'MB' : '?';
+        const gpuInfo = `GPU: ${gpuVendor} ${gpuDesc} · maxBuffer: ${maxBuf}`;
+        window._gpuInfo = `${gpuVendor} ${gpuDesc} maxBuf=${maxBuf}`;
+        console.log('[webgpu]', gpuInfo);
+        addMsg('system', `🖥️ ${gpuInfo}`);
+      }
+    } catch (e) { console.warn('GPU info failed:', e); }
+
+    updateStatus('Loading processor...');
+    setProgress(5);
+    processor = await AutoProcessor.from_pretrained(MODEL_ID);
+
+    updateStatus('下载模型权重... 0 / 1061 MB (0%)');
+    setProgress(5);
+
+    let targetDevice = await getBestDevice();
+
+    const modelOpts = {
+      dtype: {
+        embed_tokens: 'q8',
+        vision_encoder: 'q8',
+        decoder_model_merged: 'q8',
+      },
+      device: targetDevice,
+    };
+
+    try {
+      model = await Qwen3_5ForConditionalGeneration.from_pretrained(MODEL_ID, modelOpts);
+    } catch (e) {
+      if (targetDevice === 'webgpu') {
+        console.warn('[init] WebGPU failed, falling back to WASM:', e.message);
+        addMsg('system', '⚠️ WebGPU 初始化失败，正在使用 WASM 后端加载...');
+        targetDevice = 'wasm';
+        modelOpts.device = 'wasm';
+        model = await Qwen3_5ForConditionalGeneration.from_pretrained(MODEL_ID, modelOpts);
+      } else {
+        throw e;
+      }
+    }
+
+    const backendLabel = targetDevice === 'webgpu' ? 'WebGPU' : 'WASM (CPU)';
+    chat.innerHTML = '';
+    addMsg('system', `模型加载完成！当前后端：${backendLabel} · 肉糖生 Phase 11 Hot-Take\n可以开始对话了。`);
+    updateStatus('Ready · 肉糖生 · WebGPU');
+    setProgress(0);
+    input.disabled = false;
+    sendBtn.disabled = false;
+    input.value = 'AI发展很快，大家也拼命跟上快速发展，白领工作时间变长可是失业率上升工资也没有上涨，到底AI的快速发展谁受益？';
+    input.focus();
+  } catch (e) {
+    updateStatus('Error');
+    addMsg('system', '❌ 模型加载失败: ' + e.message);
+    console.error(e);
+  }
+}
+
+window.clearChat = function() {
+  if (generating) return;
+  messages = [];
+  chat.innerHTML = '';
+  addMsg('system', '新对话已开始。');
+  input.focus();
+};
+
+window.sendMessage = async function() {
+  const text = input.value.trim();
+  if (!text || generating || !model || !processor) return;
+
+  const ts = () => new Date().toISOString();
+  generating = true;
+  input.value = '';
+  input.style.height = 'auto';
+  sendBtn.disabled = true;
+  addMsg('user', text);
+  messages.push({ role: 'user', content: text });
+
+  console.log(`[chat ${ts()}] USER: ${text}`);
+
+  const assistantDiv = addMsg('assistant', '');
+  assistantDiv.innerHTML = '<span class="typing">思考中<span class="dots">...</span></span>';
+  updateStatus('Generating...');
+
+  try {
+    const allMessages = [
+      {
+        role: 'system',
+        content: [{ type: 'text', text: SYSTEM_PROMPT }],
+      },
+      ...messages.map(m => ({
+        role: m.role,
+        content: [{ type: 'text', text: m.content }],
+      })),
+    ];
+
+    const promptText = processor.apply_chat_template(allMessages, {
+      add_generation_prompt: true,
+      tokenize: false,
+      tokenizer_kwargs: { enable_thinking: false },
+    });
+
+    console.log(`[chat ${ts()}] Prompt tokens (approx): ${promptText.length}`);
+    const inputs = await processor(promptText);
+
+    let fullText = '';
+    let tokenCount = 0;
+    let firstTokenSeen = false;
+    const genStart = Date.now();
+    const watchdog = setTimeout(() => {
+      if (!firstTokenSeen) {
+        assistantDiv.textContent = '⚠️ 还没收到首个 token。可能是 WebGPU 卡住了，或浏览器缓存/显存出了问题。请打开浏览器控制台查看报错，或先切回基座模型排查。';
+        updateStatus('Generating... (waiting for first token)');
+        console.warn(`[chat ${ts()}] WARNING: no token after 20s`, { MODEL_ID, MAX_TOKENS });
+      }
+    }, isMobile ? 40000: 20000);
+
+    const streamer = new TextStreamer(processor.tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function: (token) => {
+        if (!firstTokenSeen) {
+          firstTokenSeen = true;
+          clearTimeout(watchdog);
+          const ttft = ((Date.now() - genStart) / 1000).toFixed(1);
+          window._lastTTFT = parseFloat(ttft);
+          console.log(`[chat ${ts()}] First token after ${ttft}s (TTFT)`);
+        }
+        tokenCount++;
+        fullText += token;
+        assistantDiv.textContent = stripThinkTags(fullText);
+        chat.scrollTop = chat.scrollHeight;
+      }
+    });
+
+    await model.generate({
+      ...inputs,
+      max_new_tokens: MAX_TOKENS,
+      do_sample: true,
+      temperature: 0.7,
+      top_p: 0.9,
+      streamer,
+    });
+
+    clearTimeout(watchdog);
+
+    const cleanText = stripThinkTags(fullText);
+    assistantDiv.textContent = cleanText;
+
+    const elapsed = ((Date.now() - genStart) / 1000).toFixed(1);
+    const tokPerSec = (tokenCount / ((Date.now() - genStart) / 1000)).toFixed(1);
+
+    if (!cleanText.trim()) {
+      assistantDiv.textContent = '❌ 模型执行完成，但没有输出可见文本。这通常说明 WebGPU 执行异常，或模型只产出了特殊 token。请打开控制台查看报错。';
+      console.error(`[chat ${ts()}] EMPTY response after ${elapsed}s, ${tokenCount} tokens`);
+      updateStatus('Error');
+      return;
+    }
+
+    messages.push({ role: 'assistant', content: cleanText });
+    console.log(`[chat ${ts()}] ASSISTANT (${tokenCount} tokens, ${elapsed}s, ${tokPerSec} tok/s): ${cleanText.substring(0, 200)}${cleanText.length > 200 ? '...' : ''}`);
+    updateStatus(`Ready · ${tokPerSec} tok/s · ${tokenCount} tokens`);
+
+    // Telemetry
+    try {
+      const TELEMETRY_API = 'https://bobber-routangseng-telemetry-api.hf.space/gradio_api/call/collect';
+      const sessionId = window._sessionId || (window._sessionId = Math.random().toString(36).slice(2, 10));
+      fetch(TELEMETRY_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          data: [JSON.stringify({
+            ts: ts(),
+            session_id: sessionId,
+            model: MODEL_ID,
+            question: text,
+            answer: cleanText,
+            tokens: tokenCount,
+            elapsed_s: parseFloat(elapsed),
+            tok_per_sec: parseFloat(tokPerSec),
+            ttft_s: window._lastTTFT || null,
+            device: isMobile ? 'mobile' : 'desktop',
+            user_agent: navigator.userAgent,
+            gpu: window._gpuInfo || null,
+            webgpu: !!navigator.gpu,
+            screen: `${screen.width}x${screen.height}`,
+            lang: navigator.language,
+          })]
+        }),
+      }).then(r => r.json()).then(d => {
+        if (d.event_id) {
+          console.log(`[telemetry ${ts()}] sent (event: ${d.event_id})`);
+        }
+      }).catch(e => {
+        console.warn('[telemetry] failed:', e.message);
+      });
+    } catch (e) { /* best-effort */ }
+
+  } catch (e) {
+    assistantDiv.textContent = '❌ 生成失败: ' + e.message;
+    console.error(`[chat ${ts()}] ERROR:`, e);
+    updateStatus('Error');
+  }
+
+  generating = false;
+  sendBtn.disabled = false;
+  input.focus();
+};
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    window.sendMessage();
+  }
+});
+
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+
+init();
+</script>
+</body>
+</html>
