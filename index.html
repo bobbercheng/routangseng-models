@@ -279,6 +279,12 @@ function stripThinkTags(text) {
 }
 
 async function getBestDevice() {
+    // Safari reports navigator.gpu but ONNX Runtime's WebGPU backend fails
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    if (isSafari) {
+        console.warn("Safari detected. ONNX WebGPU backend not supported — using WASM.");
+        return 'wasm';
+    }
     if (!navigator.gpu) {
         console.warn("WebGPU not supported. Falling back to WASM.");
         return 'wasm';
