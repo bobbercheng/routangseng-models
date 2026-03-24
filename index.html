@@ -259,6 +259,7 @@ let processor = null;
 let model = null;
 let messages = [];
 let generating = false;
+let activeDevice = 'webgpu';
 
 function updateStatus(text) { statusEl.textContent = text; }
 function setProgress(pct) { progressBar.style.width = pct + '%'; }
@@ -357,6 +358,7 @@ async function init() {
       }
     }
 
+    activeDevice = targetDevice;
     const backendLabel = targetDevice === 'webgpu' ? 'WebGPU' : 'WASM (CPU)';
     chat.innerHTML = '';
     addMsg('system', `模型加载完成！当前后端：${backendLabel} · 肉糖生 Phase 11 Hot-Take\n可以开始对话了。`);
@@ -440,6 +442,11 @@ window.sendMessage = async function() {
       }
     }, isMobile ? 40000: 20000);
 
+    // Use TextStreamer for both backends.
+    // On WASM, the callback still fires per token but the browser won't repaint
+    // until generate() returns. This is a known WASM limitation — the main thread
+    // is blocked. We still get the streaming text at the end.
+    let pendingUpdate = false;
     const streamer = new TextStreamer(processor.tokenizer, {
       skip_prompt: true,
       skip_special_tokens: true,
@@ -453,8 +460,15 @@ window.sendMessage = async function() {
         }
         tokenCount++;
         fullText += token;
-        assistantDiv.textContent = stripThinkTags(fullText);
-        chat.scrollTop = chat.scrollHeight;
+        // Batch DOM updates — schedule one update per animation frame
+        if (!pendingUpdate) {
+          pendingUpdate = true;
+          requestAnimationFrame(() => {
+            assistantDiv.textContent = stripThinkTags(fullText);
+            chat.scrollTop = chat.scrollHeight;
+            pendingUpdate = false;
+          });
+        }
       }
     });
 
