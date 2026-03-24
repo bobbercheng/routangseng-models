@@ -39,9 +39,9 @@ button:hover:not(:disabled) { background: #c73e54; }
   <div class="msg system">正在加载模型，请稍候... (浏览器本地 WebGPU，首次加载需下载约 1GB 权重)</div>
 </div>
 <footer>
-  <button id="clear" onclick="clearChat()" title="新对话" style="background:#0f3460;padding:10px 12px;">🗑</button>
+  <button id="clear" title="新对话" style="background:#0f3460;padding:10px 12px;">🗑</button>
   <textarea id="input" rows="1" placeholder="输入消息..." disabled></textarea>
-  <button id="send" disabled onclick="sendMessage()">发送</button>
+  <button id="send" disabled>发送</button>
 </footer>
 
 <!-- CDN override: ALL model files served from GitHub Pages -->
@@ -535,6 +535,9 @@ input.addEventListener('input', () => {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 120) + 'px';
 });
+
+document.getElementById('send').addEventListener('click', () => { window.sendMessage(); });
+document.getElementById('clear').addEventListener('click', () => { window.clearChat(); });
 
 init();
 </script>
